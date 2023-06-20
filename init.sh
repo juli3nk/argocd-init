@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
 
-GH_ORG=${1:-}
-GH_REPO=${2:-}
+GS_ORG=${1:-}
+GS_REPO=${2:-}
 REPO_DIR_PATH=${3:-}
+APP_NAME=${4:-}
+GIT_SVC_DOMAIN=${5:-github.com}
 
-HELM_CHART_URL_ARGOCD="https://argoproj.github.io/argo-helm"
-NAME_ARGOCD="argo-cd"
-REPO_URL="https://github.com/${GH_ORG}/${GH_REPO}.git"
+ENV_NAME="staging"
+
+ARGOCD_NAME="argo-cd"
+ARGOCD_HELM_CHART_URL="https://argoproj.github.io/argo-helm"
+ARGOCD_HELM_CHART_VERSION="5.36.3"
+ARGOCD_NAMESPACE="argocd"
+
+REPO_URL="https://${GIT_SVC_DOMAIN}/${GS_ORG}/${GS_REPO}.git"
 
 
 command -v helm > /dev/null || { echo -e "\"helm\" command not found" ; exit 1 ; }
 
-if [ -z "$GH_ORG" ]; then
-  echo -e "Github org is not provided"
+if [ -z "$GS_ORG" ]; then
+  echo -e "Git org is not provided"
   exit 1
 fi
 
-if [ -z "$GH_REPO" ]; then
-  echo -e "Github repo is not provided"
+if [ -z "$GS_REPO" ]; then
+  echo -e "Git repo is not provided"
   exit 1
 fi
 
@@ -31,29 +38,41 @@ if [ ! -d "$REPO_DIR_PATH" ]; then
   exit 1
 fi
 
-if [ $(git ls-remote git@github.com:${GH_ORG}/${GH_REPO}.git &> /dev/null ; echo $?) -gt 0 ]; then
-  echo -e "repository \"${GH_REPO}\" does not exist"
+if [ $(git ls-remote git@${GIT_SVC_DOMAIN}:${GS_ORG}/${GS_REPO}.git &> /dev/null ; echo $?) -gt 0 ]; then
+  echo -e "repository \"${GS_REPO}\" does not exist"
   exit 1
 fi
 
 
-mkdir -p ${REPO_DIR_PATH}/${GH_REPO}/charts/argo-cd
+PROJ_EXISTS="false"
+if [ ! -d "${REPO_DIR_PATH}/${GS_REPO}" ]; then
+    mkdir -p "${REPO_DIR_PATH}/${GS_REPO}/envs/${ENV_NAME}/{apps,charts,customs,scripts}"
 
-cd ${REPO_DIR_PATH}/${GH_REPO}
+    # Scripts
+    cp scripts/*.sh "${REPO_DIR_PATH}/${GS_REPO}/scripts/"
+else
+    PROJ_EXISTS="true"
+fi
 
-# 
-cat << EOF > charts/argo-cd/Chart.yaml
+
+cd "${REPO_DIR_PATH}/${GS_REPO}"
+
+if [ "$PROJ_EXISTS" == "false" -a "$APP_NAME" == "root" ]; then
+    # Argo CD helm chart
+    mkdir -p charts/argo-cd
+
+    cat << EOF > charts/argo-cd/Chart.yaml
 ---
 apiVersion: v2
 name: argo-cd
 version: 1.0.0
 dependencies:
-  - name: $NAME_ARGOCD
-    repository: $HELM_CHART_URL_ARGOCD
-    version: 4.2.2
+  - name: $ARGOCD_NAME
+    repository: $ARGOCD_HELM_CHART_URL
+    version: $ARGOCD_HELM_CHART_VERSION
 EOF
 
-cat << EOF > charts/argo-cd/values.yaml
+    cat << EOF > charts/argo-cd/values.yaml
 ---
 argo-cd:
   dex:
@@ -64,19 +83,20 @@ argo-cd:
     config:
       repositories: |
         - type: helm
-          name: $NAME_ARGOCD
-          url: $HELM_CHART_URL_ARGOCD
+          name: $ARGOCD_NAME
+          url: $ARGOCD_HELM_CHART_URL
 EOF
 
-echo "charts/" > charts/argo-cd/.gitignore
+    echo "charts/" > charts/argo-cd/.gitignore
+fi
 
-# Root app
+# App Root
 mkdir -p apps/templates
 
 cat << EOF > apps/Chart.yaml
 ---
 apiVersion: v2
-name: root
+name: $APP_NAME
 version: 1.0.0
 EOF
 
@@ -90,19 +110,20 @@ spec:
     targetRevision: HEAD
 EOF
 
-cat << EOF > apps/templates/root.yaml
+cat << EOF > apps/templates/${APP_NAME}.yaml
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: root
+  name: $APP_NAME
+  namespace: $ARGOCD_NAMESPACE
   finalizers:
   - resources-finalizer.argocd.argoproj.io
 spec:
   project: default
   destination:
     server: {{ .Values.spec.destination.server.local }}
-    namespace: default
+    namespace: $ARGOCD_NAMESPACE
   source:
     path: apps/
     repoURL: {{ .Values.spec.source.repoURL }}
@@ -114,20 +135,21 @@ spec:
 EOF
 
 # App ArgoCD
-cat << EOF > apps/templates/argo-cd.yaml
+if [ "$PROJ_EXISTS" == "false" -a "$APP_NAME" == "root" ]; then
+    cat << EOF > apps/templates/argo-cd.yaml
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: argo-cd
-  namespace: default
+  namespace: $ARGOCD_NAMESPACE
   finalizers:
   - resources-finalizer.argocd.argoproj.io
 spec:
   project: default
   destination:
     server: {{ .Values.spec.destination.server.local }}
-    namespace: default
+    namespace: $ARGOCD_NAMESPACE
   source:
     path: charts/argo-cd
     repoURL: {{ .Values.spec.source.repoURL }}
@@ -137,24 +159,42 @@ spec:
       prune: true
       selfHeal: true
 EOF
+fi
+
 
 # Helm
-helm repo add $NAME_ARGOCD $HELM_CHART_URL_ARGOCD
-helm dep update charts/argo-cd/
+if [ "$PROJ_EXISTS" == "false" -a "$APP_NAME" == "root" ]; then
+    helm repo add "$ARGOCD_NAME" "$ARGOCD_HELM_CHART_URL"
+    helm dep update charts/argo-cd/
+fi
 
 # Git
-git init
-git branch -m main
-git remote add origin git@github.com:${GH_ORG}/${GH_REPO}.git
+if [ "$PROJ_EXISTS" == "false" ]; then
+    git init
+    git branch -m main
+    git remote add origin "git@${GIT_SVC_DOMAIN}:${GS_ORG}/${GS_REPO}.git"
 
-git add .
-git commit -m "Initial commit"
-git push -u origin main
+    git add .
+    git commit -m "Initial commit"
+    git push -u origin main
+else
+    git add .
+    git commit -m "Add ${APP_NAME} app"
+    git push origin main
+fi
+
 
 # Installation instruction
 clear
 
-echo -e "# Installing custom Argo CD Helm chart with the command below:\n\n"
-echo -e "helm install argo-cd ${REPO_DIR_PATH}/${GH_REPO}/charts/argo-cd/"
+if [ "$PROJ_EXISTS" == "false" -a "$APP_NAME" == "root" ]; then
+    echo -e "# Installing custom Argo CD Helm chart with the command below:\n\n"
+    echo -e "kubectl create namespace ${ARGOCD_NAMESPACE}"
+    echo -e "helm -n ${ARGOCD_NAMESPACE} install argo-cd ${REPO_DIR_PATH}/${GS_REPO}/charts/argo-cd/"
 
-echo -e "helm template ${REPO_DIR_PATH}/${GH_REPO}/apps/ | kubectl apply -f -"
+    echo -e "\n# Get initial admin password\n\n"
+    echo -e "kubectl -n ${ARGOCD_NAMESPACE} get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d ; echo"
+fi
+
+echo -e "\n# Deploy ${APP_NAME} app\n\n"
+echo -e "helm -n ${ARGOCD_NAMESPACE} template ${REPO_DIR_PATH}/${GS_REPO}/apps/${APP_NAME}/ | kubectl apply -f -"
